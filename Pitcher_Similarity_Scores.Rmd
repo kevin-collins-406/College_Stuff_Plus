@@ -1,0 +1,454 @@
+---
+title: "Pitcher Similarity Score Calculation"
+author: "Kevin Collins"
+date: "2026-02-13"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+# ==============================================================================
+# COMPLETE PITCHER SIMILARITY ANALYSIS - NEW FILE
+# ==============================================================================
+
+library(tidyverse)
+
+# ---- STEP 1: LOAD YOUR DATA ----
+# Change "YOUR_DATA.csv" to your actual filename
+new_data <- read.csv("2025_fall_scrimmage_data.csv")
+
+# ---- STEP 2: CREATE PITCHER SIMILARITY MODEL ----
+cat("Creating pitcher similarity model...\n")
+
+# Create comprehensive pitcher profiles
+pitcher_profiles <- new_data %>%
+  mutate(
+    # Standardize pitch types
+    pitch_type_clean = case_when(
+      TaggedPitchType %in% c("Fastball", "FourSeamFastBall") ~ "FF",
+      TaggedPitchType %in% c("Sinker", "TwoSeamFastBall") ~ "SI",
+      TaggedPitchType == "Cutter" ~ "FC",
+      TaggedPitchType == "Slider" ~ "SL",
+      TaggedPitchType %in% c("Curveball", "Knuckle Curve") ~ "CU",
+      TaggedPitchType %in% c("Changeup", "ChangeUp") ~ "CH",
+      TaggedPitchType == "Splitter" ~ "FS",
+      TRUE ~ "OT"
+    )) %>%
+  filter(pitch_type_clean != "OT", !is.na(RelSpeed), !is.na(SpinRate)) %>%
+  
+  # Calculate averages by pitcher and pitch type
+  group_by(Pitcher, pitch_type_clean) %>%
+  summarise(
+    n_pitches = n(),
+    avg_velocity = mean(RelSpeed, na.rm = TRUE),
+    avg_spin_rate = mean(SpinRate, na.rm = TRUE),
+    avg_h_break = mean(HorzBreak, na.rm = TRUE),
+    avg_v_break = mean(InducedVertBreak, na.rm = TRUE),
+    avg_extension = mean(Extension, na.rm = TRUE),
+    avg_release_height = mean(RelHeight, na.rm = TRUE),
+    avg_release_side = mean(RelSide, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  filter(n_pitches >= 10)  # Minimum pitch requirement
+
+# Calculate total pitches per pitcher for usage rates
+pitcher_totals <- new_data %>%
+  filter(!is.na(TaggedPitchType)) %>%
+  count(Pitcher, name = "total_pitches")
+
+# Add usage rates
+pitcher_profiles <- pitcher_profiles %>%
+  left_join(pitcher_totals, by = "Pitcher") %>%
+  mutate(usage_rate = n_pitches / total_pitches)
+
+# Create feature matrix for similarity calculations
+feature_matrix <- pitcher_profiles %>%
+  select(Pitcher, pitch_type_clean, avg_velocity, avg_spin_rate, 
+         avg_h_break, avg_v_break, avg_extension, avg_release_height, 
+         avg_release_side, usage_rate) %>%
+  pivot_wider(
+    names_from = pitch_type_clean,
+    values_from = c(avg_velocity, avg_spin_rate, avg_h_break, avg_v_break, 
+                   avg_extension, avg_release_height, avg_release_side, usage_rate),
+    values_fill = 0
+  ) %>%
+  column_to_rownames("Pitcher")
+
+# Replace NA values with 0
+feature_matrix[is.na(feature_matrix)] <- 0
+
+# Calculate similarity scores
+feature_matrix_scaled <- scale(feature_matrix)
+distance_matrix <- dist(feature_matrix_scaled, method = "manhattan")
+max_distance <- max(distance_matrix, na.rm = TRUE)
+similarity_matrix <- 100 * (1 - (as.matrix(distance_matrix) / max_distance))
+diag(similarity_matrix) <- 100
+
+cat("Similarity model created successfully!\n")
+cat("Available pitchers:", nrow(similarity_matrix), "\n\n")
+
+# ---- STEP 3: FUNCTIONS TO FIND SIMILAR PITCHERS ----
+find_pitcher_similarities <- function(pitcher_name, top_n = 5) {
+  
+  if (!pitcher_name %in% rownames(similarity_matrix)) {
+    available_pitchers <- rownames(similarity_matrix)
+    cat("Pitcher not found. Available pitchers include:\n")
+    cat(paste(head(available_pitchers, 10), collapse = ", "), "...\n")
+    return(NULL)
+  }
+  
+  # Get similarities
+  similarities <- similarity_matrix[pitcher_name, ]
+  similarities <- similarities[similarities < 100]  # Remove self
+  similarities <- sort(similarities, decreasing = TRUE)
+  
+  similar_pitchers <- data.frame(
+    pitcher = names(similarities[1:min(top_n, length(similarities))]),
+    similarity_score = round(similarities[1:min(top_n, length(similarities))], 1),
+    rank = 1:min(top_n, length(similarities))
+  )
+  
+  cat("\nPITCHERS MOST SIMILAR TO", toupper(pitcher_name), "\n")
+  cat(paste(rep("=", 50), collapse=""), "\n")
+  
+  for(i in 1:nrow(similar_pitchers)) {
+    pitcher <- similar_pitchers[i,]
+    cat(sprintf("%d. %s (%.1f%% similar)\n", 
+                pitcher$rank, pitcher$pitcher, pitcher$similarity_score))
+  }
+  
+  return(similar_pitchers)
+}
+
+# Show pitcher comparison details
+show_pitcher_details <- function(pitcher_name) {
+  details <- pitcher_profiles %>% 
+    filter(Pitcher == pitcher_name) %>%
+    arrange(desc(usage_rate))
+  
+  if(nrow(details) == 0) {
+    cat("Pitcher not found.\n")
+    return(NULL)
+  }
+  
+  cat("\nPITCH DETAILS FOR", toupper(pitcher_name), "\n")
+  cat(paste(rep("=", 40), collapse=""), "\n")
+  
+  for(i in 1:nrow(details)) {
+    pitch <- details[i,]
+    cat(sprintf("%s: %.1f mph | %.0f rpm | %.1f\" H | %.1f\" V | %.1f%% usage\n",
+                pitch$pitch_type_clean, pitch$avg_velocity, pitch$avg_spin_rate,
+                pitch$avg_h_break, pitch$avg_v_break, pitch$usage_rate * 100))
+  }
+  
+  return(details)
+}
+
+# ---- STEP 4: EXPLORE YOUR DATA ----
+# Show available pitchers
+cat("AVAILABLE PITCHERS (first 20):\n")
+cat(paste(rep("=", 40), collapse=""), "\n")
+available_pitchers <- rownames(similarity_matrix)
+print(head(available_pitchers, 20))
+
+cat("\nTo find similar pitchers, use:\n")
+cat("find_pitcher_similarities('Pitcher Name')\n\n")
+
+cat("To see pitcher details, use:\n")
+cat("show_pitcher_details('Pitcher Name')\n\n")
+
+# Example with first pitcher
+example_pitcher <- available_pitchers[1]
+cat("EXAMPLE - Similar pitchers to", example_pitcher, ":\n")
+example_results <- find_pitcher_similarities(example_pitcher, top_n = 3)
+```
+
+
+```{r}
+# ==============================================================================
+# SIMILARITY SCORE VERIFICATION AND VISUALIZATION
+# ==============================================================================
+
+library(tidyverse)
+library(corrplot)
+library(ggplot2)
+library(pheatmap)
+
+# ---- 1. VISUAL VALIDATION: Compare Similar Pitchers Side-by-Side ----
+compare_pitcher_profiles <- function(pitcher1, pitcher2) {
+  
+  # Get profiles for both pitchers
+  profile1 <- pitcher_profiles %>% filter(Pitcher == pitcher1)
+  profile2 <- pitcher_profiles %>% filter(Pitcher == pitcher2)
+  
+  if(nrow(profile1) == 0 || nrow(profile2) == 0) {
+    cat("One or both pitchers not found\n")
+    return(NULL)
+  }
+  
+  # Combine for comparison
+  comparison <- bind_rows(
+    profile1 %>% mutate(pitcher_name = pitcher1),
+    profile2 %>% mutate(pitcher_name = pitcher2)
+  )
+  
+  # Create radar chart comparison
+  radar_data <- comparison %>%
+    select(pitcher_name, pitch_type_clean, avg_velocity, avg_spin_rate, 
+           avg_h_break, avg_v_break, usage_rate) %>%
+    pivot_longer(cols = c(avg_velocity, avg_spin_rate, avg_h_break, avg_v_break, usage_rate),
+                names_to = "metric", values_to = "value") %>%
+    pivot_wider(names_from = pitcher_name, values_from = value, values_fill = 0)
+  
+  # Side-by-side comparison plot
+  comp_plot <- comparison %>%
+    select(pitcher_name, pitch_type_clean, avg_velocity, avg_spin_rate, 
+           avg_h_break, avg_v_break, usage_rate) %>%
+    pivot_longer(cols = -c(pitcher_name, pitch_type_clean), 
+                names_to = "metric", values_to = "value") %>%
+    ggplot(aes(x = pitch_type_clean, y = value, fill = pitcher_name)) +
+    geom_col(position = "dodge", alpha = 0.7) +
+    facet_wrap(~metric, scales = "free_y") +
+    labs(title = paste("Comparison:", pitcher1, "vs", pitcher2),
+         x = "Pitch Type", y = "Value", fill = "Pitcher") +
+    theme_minimal() +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1))
+  
+  print(comp_plot)
+  return(comparison)
+}
+
+# ---- 2. SIMILARITY HEATMAP ----
+create_similarity_heatmap <- function(top_n_pitchers = 20) {
+  
+  # Get top N pitchers by total pitches
+  top_pitchers <- pitcher_totals %>%
+    arrange(desc(total_pitches)) %>%
+    slice_head(n = top_n_pitchers) %>%
+    pull(Pitcher)
+  
+  # Subset similarity matrix
+  heatmap_data <- similarity_matrix[top_pitchers, top_pitchers]
+  
+  # Create heatmap
+  pheatmap(heatmap_data,
+           main = paste("Pitcher Similarity Heatmap (Top", top_n_pitchers, "Pitchers)"),
+           color = colorRampPalette(c("white", "lightblue", "darkblue"))(100),
+           fontsize = 8,
+           fontsize_row = 6,
+           fontsize_col = 6,
+           angle_col = 45)
+}
+
+# ---- 3. VALIDATION: Check if Similar Pitchers Have Similar Stuff+ Scores ----
+validate_with_stuff_plus <- function() {
+  
+  # Load Stuff+ results if available
+  if(exists("new_college_results_final")) {
+    
+    # Create validation dataset
+    validation_data <- data.frame()
+    
+    # Sample some pitchers and their most similar matches
+    sample_pitchers <- sample(rownames(similarity_matrix), min(10, nrow(similarity_matrix)))
+    
+    for(pitcher in sample_pitchers) {
+      similar <- find_pitcher_similarities(pitcher, top_n = 3)
+      if(!is.null(similar)) {
+        validation_data <- bind_rows(validation_data,
+          data.frame(
+            target_pitcher = pitcher,
+            similar_pitcher = similar$pitcher,
+            similarity_score = similar$similarity_score
+          )
+        )
+      }
+    }
+    
+    # Join with Stuff+ scores
+    stuff_validation <- validation_data %>%
+      left_join(new_college_results_final %>% 
+                select(player_name, pitch_type, avg_stuff_plus) %>%
+                rename(target_pitcher = player_name),
+                by = "target_pitcher") %>%
+      left_join(new_college_results_final %>% 
+                select(player_name, pitch_type, avg_stuff_plus) %>%
+                rename(similar_pitcher = player_name, similar_stuff_plus = avg_stuff_plus),
+                by = c("similar_pitcher", "pitch_type"))
+    
+    # Plot correlation
+    correlation_plot <- stuff_validation %>%
+      filter(!is.na(avg_stuff_plus), !is.na(similar_stuff_plus)) %>%
+      ggplot(aes(x = avg_stuff_plus, y = similar_stuff_plus, color = similarity_score)) +
+      geom_point(alpha = 0.6, size = 2) +
+      geom_smooth(method = "lm", se = TRUE, color = "red") +
+      scale_color_gradient(low = "lightblue", high = "darkblue", name = "Similarity\nScore") +
+      labs(title = "Validation: Similar Pitchers Should Have Similar Stuff+ Scores",
+           x = "Target Pitcher Stuff+", y = "Similar Pitcher Stuff+") +
+      theme_minimal()
+    
+    print(correlation_plot)
+    
+    # Calculate correlation
+    correlation <- cor(stuff_validation$avg_stuff_plus, stuff_validation$similar_stuff_plus, 
+                      use = "complete.obs")
+    cat("Correlation between similar pitchers' Stuff+ scores:", round(correlation, 3), "\n")
+    
+    return(stuff_validation)
+  } else {
+    cat("Stuff+ results not available for validation\n")
+    return(NULL)
+  }
+}
+
+# ---- 4. DIMENSIONALITY REDUCTION VISUALIZATION ----
+visualize_pitcher_clusters <- function() {
+  
+  # PCA for visualization
+  pca_result <- prcomp(feature_matrix_scaled, center = TRUE, scale. = TRUE)
+  
+  # Create PCA plot
+  pca_data <- data.frame(
+    pitcher = rownames(feature_matrix_scaled),
+    PC1 = pca_result$x[,1],
+    PC2 = pca_result$x[,2]
+  )
+  
+  pca_plot <- ggplot(pca_data, aes(x = PC1, y = PC2)) +
+    geom_point(alpha = 0.6, size = 2) +
+    labs(title = "Pitcher Similarity Visualization (PCA)",
+         subtitle = paste("PC1 explains", round(summary(pca_result)$importance[2,1]*100, 1), 
+                         "%, PC2 explains", round(summary(pca_result)$importance[2,2]*100, 1), "%"),
+         x = paste("PC1 (", round(summary(pca_result)$importance[2,1]*100, 1), "% variance)"),
+         y = paste("PC2 (", round(summary(pca_result)$importance[2,2]*100, 1), "% variance)")) +
+    theme_minimal()
+  
+  print(pca_plot)
+  return(pca_result)
+}
+
+# ---- 5. FEATURE IMPORTANCE ANALYSIS ----
+analyze_similarity_drivers <- function() {
+  
+  # Calculate which features drive similarity most
+  feature_importance <- data.frame(
+    feature = colnames(feature_matrix),
+    variance = apply(feature_matrix_scaled, 2, var),
+    mean_abs_value = apply(abs(feature_matrix_scaled), 2, mean)
+  ) %>%
+    arrange(desc(variance))
+  
+  importance_plot <- feature_importance %>%
+    slice_head(n = 15) %>%
+    ggplot(aes(x = reorder(feature, variance), y = variance)) +
+    geom_col(fill = "steelblue", alpha = 0.7) +
+    coord_flip() +
+    labs(title = "Features That Drive Pitcher Similarity",
+         subtitle = "Higher variance = more important for distinguishing pitchers",
+         x = "Feature", y = "Variance") +
+    theme_minimal()
+  
+  print(importance_plot)
+  return(feature_importance)
+}
+
+# ---- EXECUTE VALIDATION ----
+cat("Running similarity score validation...\n\n")
+
+# 1. Create similarity heatmap
+cat("1. Creating similarity heatmap...\n")
+create_similarity_heatmap(15)
+
+# 2. Visualize pitcher clusters
+cat("\n2. Creating PCA visualization...\n")
+pca_results <- visualize_pitcher_clusters()
+
+# 3. Example Comparison
+cat("\n4. Example pitcher comparison...\n")
+if(nrow(similarity_matrix) >= 2) {
+  pitcher1 <- rownames(similarity_matrix)[1]
+  pitcher2 <- rownames(similarity_matrix)[2]
+  example_comparison <- compare_pitcher_profiles(pitcher1, pitcher2)
+}
+
+# 5. Validate with Stuff+ if available
+cat("\n5. Validating with Stuff+ scores...\n")
+validation_results <- validate_with_stuff_plus()
+
+cat("\nValidation complete! Use these functions to explore specific comparisons:\n")
+cat("- compare_pitcher_profiles('Pitcher A', 'Pitcher B')\n")
+cat("- create_similarity_heatmap(20)\n")
+cat("- visualize_pitcher_clusters()\n")
+```
+
+```{r}
+# ---- 5. FEATURE IMPORTANCE ANALYSIS (CORRECTED) ----
+analyze_similarity_drivers <- function() {
+  
+  # Calculate which features drive similarity most using ORIGINAL data
+  feature_importance <- data.frame(
+    feature = colnames(feature_matrix),
+    variance = apply(feature_matrix, 2, var, na.rm = TRUE),  # Use original matrix
+    mean_abs_value = apply(abs(feature_matrix), 2, mean, na.rm = TRUE),  # Use original matrix
+    coefficient_of_variation = apply(feature_matrix, 2, function(x) sd(x, na.rm = TRUE) / mean(x, na.rm = TRUE))
+  ) %>%
+    arrange(desc(variance))
+  
+  # Plot variance of original features
+  importance_plot <- feature_importance %>%
+    slice_head(n = 15) %>%
+    ggplot(aes(x = reorder(feature, variance), y = variance)) +
+    geom_col(fill = "steelblue", alpha = 0.7) +
+    coord_flip() +
+    labs(title = "Features That Drive Pitcher Similarity",
+         subtitle = "Higher variance = more important for distinguishing pitchers (original scale)",
+         x = "Feature", y = "Variance (Original Scale)") +
+    theme_minimal()
+  
+  print(importance_plot)
+  
+  # Also show coefficient of variation (normalized measure)
+  cv_plot <- feature_importance %>%
+    slice_head(n = 15) %>%
+    ggplot(aes(x = reorder(feature, coefficient_of_variation), y = coefficient_of_variation)) +
+    geom_col(fill = "darkgreen", alpha = 0.7) +
+    coord_flip() +
+    labs(title = "Feature Variability (Coefficient of Variation)",
+         subtitle = "CV = SD/Mean - shows relative variability independent of scale",
+         x = "Feature", y = "Coefficient of Variation") +
+    theme_minimal()
+  
+  print(cv_plot)
+  
+  return(feature_importance)
+}
+
+# Alternative: Show feature ranges
+show_feature_ranges <- function() {
+  
+  feature_ranges <- data.frame(
+    feature = colnames(feature_matrix),
+    min_val = apply(feature_matrix, 2, min, na.rm = TRUE),
+    max_val = apply(feature_matrix, 2, max, na.rm = TRUE),
+    range = apply(feature_matrix, 2, function(x) max(x, na.rm = TRUE) - min(x, na.rm = TRUE))
+  ) %>%
+    arrange(desc(range))
+  
+  range_plot <- feature_ranges %>%
+    slice_head(n = 15) %>%
+    ggplot(aes(x = reorder(feature, range), y = range)) +
+    geom_col(fill = "orange", alpha = 0.7) +
+    coord_flip() +
+    labs(title = "Feature Ranges",
+         subtitle = "Larger ranges indicate more variation between pitchers",
+         x = "Feature", y = "Range (Max - Min)") +
+    theme_minimal()
+  
+  print(range_plot)
+  return(feature_ranges)
+}
+```
+

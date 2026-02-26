@@ -1,0 +1,319 @@
+---
+title: "Stuff+Demo2"
+author: "Kevin Collins"
+date: "2026-01-22"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+# ==============================================================================
+# USER INPUTS
+# ==============================================================================
+new_data <- read.csv("2025_fall_scrimmage_data.csv")  # <-- USER CHANGES THIS LINE FOR DATA
+
+run_date <- "2025-10-11"  # <-- USER INPUT DATE (YYYY-MM-DD)
+# ==============================================================================
+
+```
+
+```{r}
+# ==============================================================================
+# STREAMLINED STUFF+ ANALYSIS - READY TO USE
+# ==============================================================================
+
+library(tidyverse)
+library(xgboost)
+
+# Load parameters and results (Standard RDS/CSV loading)
+mlb_standardization_params <- readRDS("mlb_standardization_params_no_spinaxis.rds")
+college_stuff_scaling <- read.csv("college_stuff_plus_scaling.csv")
+college_data_standardized <- read.csv("college_data_cleaned_standardized.csv")
+
+# ---- ROBUST MODEL LOADING (Solution 2) ----
+cat("Loading and reviving Stuff+ models...\n")
+
+# 1. Load the list of raw binary models
+models_raw_list <- readRDS("mlb_stuff_plus_models_no_spinaxis.rds")
+
+# 2. Revive them back into active XGBoost objects
+# This effectively "recompiles" the model for the current user's specific XGBoost version
+models_no_spinaxis <- lapply(models_raw_list, function(raw_model) {
+  xgb.load.raw(raw_model)
+})
+
+# Define which features need standardization (absolute metrics)
+features_to_standardize <- c(
+  "release_speed", "release_spin_rate", "pfx_x_adj", "pfx_z",
+  "movement_magnitude", "release_extension",
+  "game_velo_diff", "game_pfx_x_diff", "game_pfx_z_diff",
+  "game_spin_diff", "game_movement_magnitude_diff"
+)
+
+# Features to keep as-is (angles and relative measures)
+features_no_standardization <- c(
+  "movement_angle", "release_pos_x_adj", "release_pos_z",
+  "game_movement_angle_diff", "game_release_consistency", 
+  "game_release_x_deviation", "game_release_z_deviation"
+)
+
+# Define feature set for modeling (standardized + non-standardized)
+all_features <- c(paste0(features_to_standardize, "_z"), features_no_standardization)
+
+# ==============================================================================
+# TRACKMAN DATA PROCESSING FUNCTIONS
+# ==============================================================================
+
+# ---- 3.1: Define TrackMan Processing Functions ----
+# Function to process new TrackMan college datasets
+process_new_college_data <- function(trackman_data) {
+  trackman_data <- trackman_data %>%
+    # Apply data quality filters
+    filter(
+      !is.na(RelSpeed), !is.na(SpinRate), !is.na(HorzBreak), 
+      !is.na(InducedVertBreak), !is.na(Extension),
+      RelSpeed > 50, SpinRate >= 0, SpinRate <= 4000
+    ) %>%
+    mutate(
+      # Apply handedness adjustments
+      pfx_x_adj = ifelse(PitcherThrows == "Left", -HorzBreak, HorzBreak),
+      release_pos_x_adj = ifelse(PitcherThrows == "Left", -RelSide, RelSide),
+      
+      # Map TrackMan columns to standardized names
+      player_name = Pitcher, game_pk = GameID, release_speed = RelSpeed,
+      release_spin_rate = SpinRate, pfx_z = InducedVertBreak,
+      release_extension = Extension, release_pos_z = RelHeight,
+      
+      # Calculate movement metrics
+      movement_magnitude = sqrt(pfx_x_adj^2 + pfx_z^2),
+      movement_angle = atan2(pfx_z, pfx_x_adj) * 180 / pi,
+      
+      # Map TrackMan pitch types to standardized classifications
+      pitch_type_clean = case_when(
+        TaggedPitchType %in% c("Fastball", "FourSeamFastBall") ~ "FF",
+        TaggedPitchType %in% c("Sinker", "TwoSeamFastBall") ~ "SI",
+        TaggedPitchType == "Cutter" ~ "FC",
+        TaggedPitchType == "Slider" ~ "SL",
+        TaggedPitchType %in% c("Curveball", "Knuckle Curve") ~ "CU",
+        TaggedPitchType %in% c("Changeup", "ChangeUp") ~ "CH",
+        TaggedPitchType == "Splitter" ~ "FS",
+        TRUE ~ "OT"
+      ),
+      season = 2025  # Assuming current season
+    ) %>%
+    filter(pitch_type_clean != "OT")
+  
+  # Calculate game profiles for TrackMan data
+  game_profiles <- trackman_data %>%
+    filter(pitch_type_clean %in% c("FF", "SI", "FC")) %>%
+    group_by(player_name, game_pk, pitch_type_clean) %>%
+    summarise(
+      across(c(release_speed, pfx_x_adj, pfx_z, release_spin_rate, 
+               release_pos_x_adj, release_pos_z, movement_magnitude, movement_angle),
+             \(x) mean(x, na.rm = TRUE), .names = "game_primary_{.col}"),
+      n_pitches = n(), .groups = "drop"
+    ) %>%
+    group_by(player_name, game_pk) %>%
+    slice_max(n_pitches, n = 1) %>%
+    rename(game_primary_fastball = pitch_type_clean)
+  
+  # Calculate game-level differences for TrackMan data
+  final_data <- trackman_data %>%
+    left_join(game_profiles, by = c("player_name", "game_pk"), 
+              relationship = "many-to-many") %>%
+    mutate(
+      # Calculate same difference metrics as other datasets
+      game_primary = (pitch_type_clean == game_primary_fastball),
+      game_velo_diff = ifelse(!game_primary & !is.na(game_primary_release_speed), 
+                              release_speed - game_primary_release_speed, 0),
+      game_pfx_x_diff = ifelse(!game_primary & !is.na(game_primary_pfx_x_adj),
+                               pfx_x_adj - game_primary_pfx_x_adj, 0),
+      game_pfx_z_diff = ifelse(!game_primary & !is.na(game_primary_pfx_z),
+                               pfx_z - game_primary_pfx_z, 0),
+      game_spin_diff = ifelse(!game_primary & !is.na(game_primary_release_spin_rate),
+                              release_spin_rate - game_primary_release_spin_rate, 0),
+      game_movement_magnitude_diff = ifelse(!game_primary & !is.na(game_primary_movement_magnitude),
+                                            movement_magnitude - game_primary_movement_magnitude, 0),
+      game_movement_angle_diff = ifelse(!game_primary & !is.na(game_primary_movement_angle),
+                                        movement_angle - game_primary_movement_angle, 0),
+      game_release_x_deviation = abs(release_pos_x_adj - game_primary_release_pos_x_adj),
+      game_release_z_deviation = abs(release_pos_z - game_primary_release_pos_z),
+      game_release_consistency = sqrt(game_release_x_deviation^2 + game_release_z_deviation^2)
+    ) %>%
+    # Select relevant columns for modeling
+    select(player_name, season, pitch_type_clean, all_of(features_to_standardize), 
+           all_of(features_no_standardization))
+  
+  return(final_data)
+}
+
+# Function to standardize new data using reference parameters
+standardize_with_reference <- function(data, reference_params) {
+  data %>%
+    left_join(reference_params, by = "pitch_type_clean") %>%
+    mutate(
+      # Apply standardization using reference dataset parameters
+      across(all_of(features_to_standardize), 
+             ~(.x - get(paste0(cur_column(), "_mean"))) / get(paste0(cur_column(), "_sd")),
+             .names = "{.col}_z")
+    ) %>%
+    select(-contains("_mean"), -contains("_sd"))  # Remove temporary columns
+}
+
+# ---- 3.2: Example TrackMan Data Processing ----
+# Load original college standardization parameters for reference
+college_standardization_params <- read_csv("college_data_cleaned_standardized.csv") %>%
+  group_by(pitch_type_clean) %>%
+  summarise(
+    across(all_of(features_to_standardize), 
+           list(mean = ~mean(.x, na.rm = TRUE), sd = ~sd(.x, na.rm = TRUE)),
+           .names = "{.col}_{.fn}"),
+    .groups = "drop"
+  )
+
+new_college_data <- process_new_college_data(new_data)
+
+# Standardize using original college dataset parameters
+new_college_standardized <- standardize_with_reference(new_college_data, college_standardization_params)
+
+# ---- 3.3: Apply Models to New TrackMan Data ----
+# Generate predictions for new TrackMan data
+new_college_predictions <- data.frame()
+available_pitch_types <- intersect(unique(new_college_standardized$pitch_type_clean), 
+                                   names(models_no_spinaxis))
+
+for(pitch in available_pitch_types) {
+  college_pitch <- new_college_standardized %>%
+    filter(pitch_type_clean == pitch) %>%
+    select(player_name, season, all_of(all_features)) %>%
+    drop_na()
+  
+  if(nrow(college_pitch) > 0) {
+    # Generate predictions using MLB-trained models
+    dtest_college <- xgb.DMatrix(data = as.matrix(college_pitch[all_features]))
+    predictions <- predict(models_no_spinaxis[[pitch]], dtest_college)
+    
+    pitch_predictions <- college_pitch %>%
+      select(player_name, season) %>%
+      mutate(pitch_type = pitch, predicted_cre = predictions)
+    
+    new_college_predictions <- bind_rows(new_college_predictions, pitch_predictions)
+  }
+}
+
+# ---- 3.4: Calculate Stuff+ Using Original College Normalization ----
+# Load normalization parameters from original college data
+original_college_results <- read_csv("college_stuff_plus_scaling.csv")
+normalization_params <- original_college_results %>%
+  group_by(pitch_type) %>%
+  summarise(
+    original_mean_pred = mean(predicted_cre),
+    original_sd_pred = sd(predicted_cre),
+    .groups = "drop"
+  )
+
+# Apply consistent normalization to new TrackMan data
+new_college_stuff_results <- new_college_predictions %>%
+  left_join(normalization_params, by = "pitch_type") %>%
+  mutate(
+    # Use original college normalization for consistent Stuff+ scaling
+    stuff_plus = 100 + ((predicted_cre - original_mean_pred) / original_sd_pred * 10)
+  ) %>%
+  select(-original_mean_pred, -original_sd_pred)
+
+# Calculate CSW and average velocity from the original TrackMan data
+pitcher_metrics <- new_data %>%
+  # Create CSW binary variable
+  mutate(
+    csw = ifelse(PitchCall %in% c("StrikeCalled", "StrikeSwinging"), 1, 0),
+    
+    # Map pitch types to match your classification system
+    pitch_type_clean = case_when(
+      TaggedPitchType %in% c("Fastball", "FourSeamFastBall") ~ "FF",
+      TaggedPitchType %in% c("Sinker", "TwoSeamFastBall") ~ "SI",
+      TaggedPitchType == "Cutter" ~ "FC",
+      TaggedPitchType == "Slider" ~ "SL",
+      TaggedPitchType %in% c("Curveball", "Knuckle Curve") ~ "CU",
+      TaggedPitchType %in% c("Changeup", "ChangeUp") ~ "CH",
+      TaggedPitchType == "Splitter" ~ "FS",
+      TRUE ~ "OT"
+    )
+  ) %>%
+  filter(pitch_type_clean != "OT") %>%
+  
+  # Calculate CSW% and average velocity by pitcher and pitch type
+  group_by(Pitcher, pitch_type_clean) %>%
+  summarise(
+    csw_percent = round(mean(csw, na.rm = TRUE) * 100, 1),  # CSW percentage
+    avg_velocity = round(mean(RelSpeed, na.rm = TRUE), 1),  # Average velocity
+    n_pitches_total = n(),  # Number of pitches for verification
+    .groups = "drop"
+  ) %>%
+  rename(
+    player_name = Pitcher,
+    pitch_type = pitch_type_clean
+  )
+
+# ---- 3.5: Generate Final Aggregated Results ----
+# Create aggregated pitcher results combining Stuff+, CSW, and velocity
+new_college_results_final <- new_college_stuff_results %>%
+  group_by(pitch_type, player_name, season) %>%
+  summarise(
+    n_pitches_stuff = n(),
+    avg_stuff_plus = round(mean(stuff_plus), 1),
+    avg_predicted_cre = round(mean(predicted_cre), 4),
+    .groups = "drop"
+  ) %>%
+  # Join with CSW and velocity metrics
+  left_join(pitcher_metrics, by = c("player_name", "pitch_type")) %>%
+  # Use the total pitch count (more comprehensive)
+  mutate(n_pitches = coalesce(n_pitches_total, n_pitches_stuff)) %>%
+  select(-n_pitches_stuff, -n_pitches_total) %>%
+  # Sort by Stuff+ within each pitch type
+  group_by(pitch_type) %>%
+  arrange(pitch_type, desc(avg_stuff_plus)) %>%
+  ungroup()
+
+# Display top 5 for each pitch type
+top_5_by_pitch <- new_college_results_final %>%
+  group_by(pitch_type) %>%
+  slice_head(n = 5) %>%
+  ungroup()
+
+print("Top 5 Pitchers by Stuff+ for Each Pitch Type:")
+for(pitch in unique(top_5_by_pitch$pitch_type)) {
+  cat("\n", pitch, ":\n")
+  cat(paste(rep("-", 60), collapse=""), "\n")
+  
+  pitch_leaders <- top_5_by_pitch %>%
+    filter(pitch_type == pitch) %>%
+    mutate(rank = row_number())
+  
+  for(i in 1:nrow(pitch_leaders)) {
+    player <- pitch_leaders[i,]
+    cat(sprintf("%d. %s: %.1f Stuff+ | %.1f mph | %.1f%% CSW (n=%d)\n",
+                player$rank, player$player_name, 
+                player$avg_stuff_plus, player$avg_velocity, 
+                player$csw_percent, player$n_pitches))
+  }
+}
+
+# ==============================================================================
+# SAVE OUTPUT FILES (DATE-STAMPED)
+# ==============================================================================
+
+write_csv(
+  new_college_results_final,
+  paste0("stuff_results_", run_date, ".csv")
+)
+
+write_csv(
+  top_5_by_pitch,
+  paste0("stuff_top5_leaderboard_", run_date, ".csv")
+)
+
+```
+

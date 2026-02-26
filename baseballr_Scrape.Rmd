@@ -1,0 +1,87 @@
+---
+title: "BaseballR Scrape"
+author: "Kevin Collins"
+date: "2025-10-23"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+# install.packages("baseballr")
+library(baseballr)
+library(tidyverse)
+library(lubridate)
+```
+
+```{r}
+# Define full season date range
+start_date <- as.Date("2025-07-20")  # approximate Opening Day
+end_date   <- as.Date("2025-07-27")  # approximate end of regular season
+
+# Create 7-day intervals (Statcast API max window)
+dates <- seq.Date(from = start_date, to = end_date, by = "7 days")
+
+# Function to safely pull each week
+get_weekly_data <- function(start_date) {
+  message("Scraping week of ", start_date)
+  end_date <- start_date + 6
+  
+  # Try-catch for API errors
+  df <- tryCatch(
+    statcast_search_pitchers(start_date = start_date, end_date = end_date),
+    error = function(e) {
+      message("Error fetching data for week of ", start_date, " — skipping.")
+      return(NULL)
+    }
+  )
+  
+  # Keep only desired columns if successful
+  if (!is.null(df)) {
+    df %>%
+      select(
+        pitcher,
+        player_name,
+        p_throws,
+        pitch_type,
+        pitch_name,
+        release_speed,
+        release_pos_x,
+        release_pos_y,
+        release_pos_z,
+        release_spin_rate,
+        spin_axis,
+        pfx_x,
+        pfx_z,
+        release_extension,
+        plate_x,
+        plate_z,
+        on_3b,
+        on_2b,
+        on_1b,
+        sz_top,
+        sz_bot,
+        description,
+        delta_pitcher_run_exp,
+        delta_run_exp
+      )
+  }
+}
+
+# Map over all date ranges and combine results
+statcast_2025 <- map_dfr(dates, get_weekly_data)
+
+# Optional: save periodically to prevent data loss
+write_csv(statcast_2025, "statcast_2025_pitch_data.csv")
+
+# Check the result
+glimpse(statcast_2025)
+head(statcast_2025)
+
+```
+
+
+
+
