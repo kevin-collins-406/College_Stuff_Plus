@@ -158,7 +158,7 @@ install.packages(c(
 - **Date consistency** - Date labels in Step 3 and Step 5 must match exactly
 - **Column structure** - New datasets must match the TrackMan format shown in example files
 - **Processing time** - Full MLB data collection takes 20-30 minutes per season
-- **Storage requirements** - Each season file is approximately 50-100MB
+- **Storage requirements** - Each season file is approximately 120MB
 - **Similarity analysis** - Requires minimum 10 pitches per pitcher for reliable similarity scores
 
 ## Applications
